@@ -1,0 +1,41 @@
+[package]
+name = "unidpp-gateway"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/unidpp/unidpp-gateway"
+description = "UniDPP interop gateway: renders the neutral core as UNTP and EN 18222 — their format is our profile"
+
+# Dependency-light on purpose (mirrors the unidpp-issuer / unidpp-gate
+# doctrine): axum/tokio for serving, serde_json for documents. All
+# model, event, crypto, and document machinery lives in the
+# path-dependency crates; the CLI lib supplies the shared passport
+# document type (the service must never fork that logic). The UNTP
+# adapter semantics are ported from unidpp-py (the semantics source);
+# the EN 18222 wire shape is mirrored from the freeDPP live-endpoint
+# artifacts captured in unidpp-py/conformance/competitors/freedpp.
+# No tracing, no metrics, no TLS stack (terminate at a fronting proxy).
+[dependencies]
+unidpp-model = { path = "../unidpp-core/crates/model" }
+unidpp-event = { path = "../unidpp-core/crates/event" }
+unidpp-signatif = { path = "../unidpp-signatif" }
+unidpp-cli = { path = "../unidpp-cli" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "time"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Integration tests drive a real unidpp-issuer instance (issuer-mode
+# rendering + live anchor verification) and hand-roll HTTP against the
+# gateway over tokio (house pattern).
+unidpp-issuer = { path = "../unidpp-issuer" }
+tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "time"] }
+
+[lib]
+name = "unidpp_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "unidpp-gateway"
+path = "src/main.rs"
