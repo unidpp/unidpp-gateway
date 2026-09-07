@@ -83,7 +83,7 @@ pub fn untp_identifier_value(id: &ProductIdentifier) -> String {
 
 /// Normalize a UNTP identifier value back to the core display form
 /// (accepts both `(01)x` and `01+x` element strings and bare keys).
-fn core_identifier_value(scheme_token: &str, value: &str) -> String {
+pub(crate) fn core_identifier_value(scheme_token: &str, value: &str) -> String {
     if let Some(key) = value.strip_prefix("(01)") {
         let mut display = format!("01+{key}");
         display = display.replace("(10)", "+10+").replace("(21)", "+21+");

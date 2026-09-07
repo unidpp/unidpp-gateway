@@ -11,6 +11,7 @@
 //!
 //! | endpoint | purpose |
 //! |---|---|
+//! | `POST /untp/ingest` | the import direction: a UNTP passport VC (bare or triad) mints a core passport with a deterministic identity; conformity → profile bindings |
 //! | `GET /untp/product/{id}` | the UNTP verifiable-credential triad (passport VC + conformity credentials + link-resolver entry) with the py-adapter verdict |
 //! | `GET /en18222/v1/dppsByProductId/{gtin}?representation=full\|compressed` | the EN 18222 REST render (default compressed, per the EN) |
 //! | `GET /healthz` | liveness |
@@ -24,7 +25,7 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -99,6 +100,8 @@ pub struct AppState {
     pub config: Config,
     /// The passport data source (fixtures + optional issuer upstream).
     pub source: PassportSource,
+    /// Passports ingested from UNTP triads (`POST /untp/ingest`).
+    pub ingested: std::sync::Mutex<crate::ingest::IngestStore>,
 }
 
 impl AppState {
@@ -106,9 +109,20 @@ impl AppState {
     pub fn new(config: Config) -> AppState {
         AppState {
             source: PassportSource::new(config.issuer_url.clone()),
+            ingested: std::sync::Mutex::new(crate::ingest::IngestStore::new()),
             config,
         }
     }
+}
+
+/// Resolve a passport from any serving source: fixtures, the issuer
+/// upstream, then the ingested store.
+async fn resolve_any(app: &Arc<AppState>, id: &str) -> Option<crate::source::GatewayPassport> {
+    if let Some(found) = app.source.resolve(id).await {
+        return Some(found);
+    }
+    let ingested = app.ingested.lock().expect("ingest store poisoned");
+    ingested.resolve(id).cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +202,7 @@ async fn discovery(State(app): State<Arc<AppState>>) -> Response {
                         renderings from one core.",
         "endpoints": {
             "untp": "GET /untp/product/{id}?freshness=",
+            "untp_ingest": "POST /untp/ingest (import direction: a UNTP passport VC or triad mints a core passport with a deterministic identity; idempotent per subject)",
             "en18222": "GET /en18222/v1/dppsByProductId/{gtin}?representation=full|compressed",
             "health": "GET /healthz",
         },
@@ -222,7 +237,9 @@ async fn discovery(State(app): State<Arc<AppState>>) -> Response {
         "conventions": [
             "as-of stamped responses (x-as-of header; as_of body member except on the frozen EN 18222 wire)",
             "no-information 404s: identical bytes for unknown and deliberately unresolvable ids (I12)",
-            "the gateway renders; it never mints",
+            "the gateway renders core passports in foreign shapes, and imports them back with a \
+             deterministic identity (render and ingest are inverse projections; imported documents \
+             carry an empty log — their events live in the source regime, the receipt records the origin)",
         ],
     });
     stamped(StatusCode::OK, &doc, Timestamp::now())
@@ -254,7 +271,7 @@ async fn untp_product(
             return bad_request("`freshness` must be an ISO 8601 duration (PnDTnHnMnS)");
         }
     }
-    let Some(passport) = app.source.resolve(&id).await else {
+    let Some(passport) = resolve_any(&app, &id).await else {
         return not_found();
     };
     let now = Timestamp::now();
@@ -281,6 +298,61 @@ async fn en18222_dpps(
     wire_stamped(StatusCode::OK, &rendered, now)
 }
 
+/// POST /untp/ingest — the import direction: a UNTP passport VC (bare
+/// or the triad this gateway renders) mints a neutral-core passport
+/// with a deterministic identity; conformity credentials land as
+/// profile bindings. Idempotent per subject identity.
+async fn untp_ingest(State(app): State<Arc<AppState>>, body: String) -> Response {
+    let stub: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => return bad_request(&format!("invalid JSON body: {e}")),
+    };
+    let now = Timestamp::now();
+    let outcome = {
+        let mut store = app.ingested.lock().expect("ingest store poisoned");
+        store.ingest(&stub, now)
+    };
+    match outcome {
+        Ok(outcome) => {
+            let status = match outcome.status {
+                crate::ingest::IngestStatus::Imported => StatusCode::CREATED,
+                crate::ingest::IngestStatus::Matched => StatusCode::OK,
+            };
+            let document = &outcome.passport.document;
+            stamped(
+                status,
+                &json!({
+                    "status": outcome.status.as_str(),
+                    "passport_id": document.passport_id.as_str(),
+                    "identity": document.product_id.to_string(),
+                    "granularity": document.product_id.granularity.to_string(),
+                    "profiles": outcome
+                        .profiles
+                        .iter()
+                        .map(|profile| {
+                            json!({
+                                "id": profile.id,
+                                "version": profile.version,
+                                "effective_from": profile.effective_from.map(|t| t.to_string()),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    "receipt": outcome.receipt,
+                }),
+                now,
+            )
+        }
+        Err(reason) => stamped(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!({
+                "status": "degraded",
+                "reason": reason,
+            }),
+            now,
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Route wiring
 // ---------------------------------------------------------------------------
@@ -290,6 +362,7 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/", get(discovery))
         .route("/healthz", get(healthz))
         .route("/untp/product/{id}", get(untp_product))
+        .route("/untp/ingest", post(untp_ingest))
         .route("/en18222/v1/dppsByProductId/{gtin}", get(en18222_dpps))
         .with_state(app)
 }
