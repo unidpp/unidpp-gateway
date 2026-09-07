@@ -197,7 +197,7 @@ async fn discovery(State(app): State<Arc<AppState>>) -> Response {
     let doc = json!({
         "service": "unidpp-gateway",
         "description": "UniDPP interop gateway: renders the neutral core in foreign protocol shapes — \
-                        their format is our profile (TODO.impl item 27 / PLAN-COMPETE play 2). The py \
+                        their format is our profile. The py \
                         adapters are the semantics source; this service ports them and serves both \
                         renderings from one core.",
         "endpoints": {

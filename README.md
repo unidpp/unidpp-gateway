@@ -1,9 +1,8 @@
 # unidpp-gateway
 
-Part of UniDPP (github.com/unidpp) — `TODO.impl` item 27
-(`10-remaining-tasks-definitive.md`, dispatchable C2): the running
-**interop gateway** — "their format is our profile" as a service
-(PLAN-COMPETE play 2). License: Apache-2.0.
+Part of UniDPP (github.com/unidpp) — the running
+**interop gateway**: "their format is our profile" as a service.
+License: Apache-2.0.
 
 The gateway renders the neutral core in foreign protocol shapes. Both
 bindings are **C4 protocol renderings**: a protocol binding is a
@@ -18,6 +17,7 @@ them into a running Rust + axum deployment (the org's service stack:
 | Endpoint | Meaning |
 |---|---|
 | `GET /untp/product/{id}?freshness=` | the **UNTP verifiable-credential triad**: DigitalProductPassport VC + DigitalConformityCredentials + link-resolver entry, with the py-adapter verdict |
+| `POST /untp/ingest` | the **import direction**: a UNTP passport VC (bare or the rendered triad) mints a core passport with a deterministic identity; idempotent per subject |
 | `GET /en18222/v1/dppsByProductId/{gtin}?representation=full\|compressed` | the **EN 18222 REST render** of the same core (default compressed, per the EN) |
 | `GET /healthz` | liveness |
 | `GET /` | discovery: both bindings documented as C4 renderings |
@@ -49,6 +49,41 @@ A port of `unidpp-py/unidpp/adapters/untp.py` in **both** directions:
   (`sha256(salt:canonical_json(stub))`, the `canonical.py` port).
   The gateway keeps it so the render → re-parse round-trip is proven
   in the tests.
+
+### Ingest (`POST /untp/ingest`)
+
+The import direction of the S12 seam, served over HTTP: a UNTP
+passport VC (bare, the rendered triad, or wrapped in `{"stub": …}`)
+mints a neutral-core passport. `parse_stub` semantics are reused
+verbatim, so render and ingest are inverse projections of one
+adapter:
+
+- **deterministic identity** — the core identity derives from the
+  subject alone (I1): the same subject from a different stub
+  **matches** rather than duplicating (`200` with
+  `"status": "matched"`, idempotent; first import answers `201` with
+  `"status": "imported"`);
+- **conformity → profile bindings** — every `standardsConformance`
+  entry lands as a bound profile;
+- **the import receipt** — origin identifiers, the commitment over
+  the stub, and counts;
+- **explicit unknown-scheme degradation** — an identifier scheme
+  with no C8 mapping answers `422 {"status": "degraded", "reason": …}`;
+  nothing is minted under a guessed scheme;
+- the imported passport's event log is empty (its events live in the
+  source regime — the receipt records the origin), and the ingested
+  store answers the same `GET /untp/product/{id}` route.
+
+```sh
+curl -s localhost:8094/untp/ingest -H 'content-type: application/json' \
+  -d @passport-vc.json | jq '{status, passport_id, identity, profiles}'
+# {
+#   "status": "imported",
+#   "passport_id": "urn:unidpp:passport:…",
+#   "identity": "https://gs1.org/voc/(01)…(21)…",
+#   "profiles": [ … the conformity credentials, bound … ]
+# }
+```
 
 ### EN 18222 binding (`urn:unidpp:profile:render:en18222`)
 
@@ -105,9 +140,10 @@ Deviations from the py original (documented in the module):
 
 ## Data source
 
-Upstream-when-reachable, seeded fixtures otherwise (the
-`unidpp-gate` doctrine). Every response carries a `source` marker
-(`fixture` | `issuer`):
+Fixtures, then the issuer upstream, then the ingested store (the S12
+imports) — in that order. Every response carries a `source` marker
+(`fixture` | `issuer`; an ingested passport answers through the
+fixture path):
 
 - **Issuer mode** (`UNIDPP_ISSUER_URL` set and reachable): the gateway
   fetches `GET {issuer}/passports/{id}` (the CLI-compatible document
@@ -148,7 +184,7 @@ UNIDPP_GATEWAY_TIMEOUT_MS # upstream timeout, default 2000
 
 ```
 cargo build            # zero warnings
-cargo test             # 43 unit + 15 integration tests, zero warnings
+cargo test             # 49 unit + 18 integration tests, zero warnings
 cargo clippy --all-targets -- -D warnings   # clean
 cargo fmt --check      # clean
 ```
@@ -169,5 +205,9 @@ ephemeral ports (and one real `unidpp-issuer` instance for the live
 upstream): discovery/health, the triad shape against the py stub
 expectations, the freshness rule over HTTP, the EN 18222 field sets
 against the artifact key sets, both round-trips, the no-information
-404, issuer mode with live anchor verification, and the
-unreachable-issuer fixture fallback.
+404, issuer mode with live anchor verification, the
+unreachable-issuer fixture fallback, and the ingest story (import,
+idempotent match of the same subject from a different stub,
+unknown-scheme 422 with nothing minted, and the render → ingest →
+render round-trip preserving identity and re-binding every
+conformity standard).

@@ -1,5 +1,5 @@
 //! The UniDPP interop gateway — "their format is our profile" as a
-//! service (TODO.impl item 27 / PLAN-COMPETE play 2, dispatchable C2).
+//! service.
 //!
 //! Two protocol renderings of one neutral core, both registered as
 //! profiles (C4: a protocol binding is a render profile, never a fork
