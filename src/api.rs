@@ -196,6 +196,8 @@ fn not_found() -> Response {
 async fn discovery(State(app): State<Arc<AppState>>) -> Response {
     let doc = json!({
         "service": "unidpp-gateway",
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_id": option_env!("UNIDPP_BUILD_ID").unwrap_or("dev"),
         "description": "UniDPP interop gateway: renders the neutral core in foreign protocol shapes — \
                         their format is our profile. The py \
                         adapters are the semantics source; this service ports them and serves both \
