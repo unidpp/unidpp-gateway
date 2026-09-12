@@ -677,3 +677,45 @@ async fn unreachable_issuer_degrades_to_fixtures() {
 fn urlenc(s: &str) -> String {
     unidpp_gateway::http::Url::encode_query_component(s)
 }
+
+#[tokio::test]
+async fn both_bindings_serve_the_same_core_state() {
+    // AD-3 / SV-5: binding pluralism — the UNTP render and the EN
+    // 18222 render are two bindings of ONE capability, serving the
+    // same core state. One passport, both protocols, one identity.
+    let server = spawn_fixtures().await;
+    let untp = get(
+        &server.base_url,
+        &format!("/untp/product/{}", urlenc(TYRE_GTIN)),
+    )
+    .await;
+    assert_eq!(untp.status, 200, "the UNTP binding serves the tyre");
+    let triad: Value = serde_json::from_str(&untp.body_string()).unwrap();
+    let untp_identity = triad["passport"]["productIdentifiers"][0]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the UNTP render carries the identity"));
+
+    let en = get(
+        &server.base_url,
+        &format!("/en18222/v1/dppsByProductId/{}", urlenc(TYRE_GTIN)),
+    )
+    .await;
+    assert_eq!(en.status, 200, "the EN 18222 binding serves the tyre");
+    let dpp: Value = serde_json::from_str(&en.body_string()).unwrap();
+    let en_identity = dpp["uniqueProductIdentifier"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the EN 18222 render carries the identity: {}", dpp));
+
+    // The UNTP form carries the GS1 AI-delimited form; the EN form
+    // the bare key. Both name the same product: the delimited form
+    // wraps the bare key.
+    let bare = untp_identity
+        .rsplit_once(")")
+        .map(|(_, rest)| rest)
+        .unwrap_or(untp_identity);
+    assert_eq!(
+        bare, en_identity,
+        "both bindings serve the same core state — the identity matches across protocols"
+    );
+    server.stop().await;
+}
