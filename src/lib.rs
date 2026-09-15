@@ -30,6 +30,7 @@ pub mod feedback;
 pub mod fixtures;
 pub mod http;
 pub mod ingest;
+pub mod scan;
 pub mod source;
 pub mod untp;
 pub mod verdict;

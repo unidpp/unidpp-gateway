@@ -59,6 +59,11 @@ pub struct Config {
     /// Admin bearer token (`UNIDPP_GATEWAY_ADMIN_TOKEN`) guarding the
     /// report listing.
     pub admin_token: Option<String>,
+    /// The scan-token policy (TODO.impl 224): TTL seconds and issuance
+    /// limit per source per minute (0 = off — the public-resolution
+    /// default; rendered by unidpp-config from the manifest).
+    pub scan_ttl_secs: u64,
+    pub scan_limit_per_minute: usize,
 }
 
 impl Default for Config {
@@ -70,6 +75,8 @@ impl Default for Config {
             feedback_journal: None,
             feedback_rate_per_minute: 0,
             admin_token: None,
+            scan_ttl_secs: 0,
+            scan_limit_per_minute: 0,
         }
     }
 }
@@ -112,6 +119,22 @@ impl Config {
                 config.admin_token = Some(token);
             }
         }
+        if let Ok(ttl) = std::env::var("UNIDPP_GATEWAY_SCAN_TTL_SECS") {
+            match ttl.trim().parse::<u64>() {
+                Ok(t) => config.scan_ttl_secs = t,
+                Err(_) => {
+                    eprintln!("unidpp-gateway: ignoring bad UNIDPP_GATEWAY_SCAN_TTL_SECS `{ttl}`")
+                }
+            }
+        }
+        if let Ok(limit) = std::env::var("UNIDPP_GATEWAY_SCAN_LIMIT_PER_MIN") {
+            match limit.trim().parse::<usize>() {
+                Ok(n) => config.scan_limit_per_minute = n,
+                Err(_) => eprintln!(
+                    "unidpp-gateway: ignoring bad UNIDPP_GATEWAY_SCAN_LIMIT_PER_MIN `{limit}`"
+                ),
+            }
+        }
         if let Ok(ms) = std::env::var("UNIDPP_GATEWAY_TIMEOUT_MS") {
             match ms.trim().parse::<u64>() {
                 Ok(ms) => config.timeout = Duration::from_millis(ms),
@@ -136,6 +159,8 @@ pub struct AppState {
     pub feedback: std::sync::Mutex<crate::feedback::FeedbackStore>,
     /// The pluggable admission gate in front of the report path.
     pub admission: std::sync::Arc<dyn crate::feedback::AdmissionControl>,
+    /// The scan-token gate (ephemeral edge state; off unless policy).
+    pub scan: std::sync::Mutex<crate::scan::ScanGate>,
 }
 
 impl AppState {
@@ -159,8 +184,58 @@ impl AppState {
             ingested: std::sync::Mutex::new(crate::ingest::IngestStore::new()),
             feedback: std::sync::Mutex::new(feedback),
             admission,
+            scan: std::sync::Mutex::new(crate::scan::ScanGate::new(
+                crate::scan::ScanPolicy {
+                    token_ttl_secs: config.scan_ttl_secs,
+                    issue_limit_per_minute: config.scan_limit_per_minute,
+                },
+            )),
             config,
         }
+    }
+}
+
+/// POST /scan-tokens {source} — issue a scan token under the
+/// configured policy (the gate states where the policy came from; no
+/// policy configured = the gate is open and issuance is a stated
+/// no-op). The source names the requester in production set by the
+/// fronting proxy (X-UniDPP-Source is accepted here).
+async fn issue_scan_token(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let source = headers
+        .get("x-unidpp-source")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("source").and_then(Value::as_str).map(str::to_string))
+        })
+        .unwrap_or_else(|| "anonymous".to_string());
+    let issued = app
+        .scan
+        .lock()
+        .expect("scan gate poisoned")
+        .issue(&source);
+    match issued {
+        Ok((token, ttl)) => build_response(
+            StatusCode::CREATED,
+            vec![("content-type".into(), "application/json".into())],
+            json!({ "token": token, "ttl_secs": ttl, "source": source }).to_string(),
+        ),
+        Err(reason) if reason.starts_with("scan-token issuance limit") => {
+            crate::scan::refusal(&reason, true)
+        }
+        // No policy configured: there is nothing to issue — stated,
+        // and not an authentication failure.
+        Err(reason) => build_response(
+            StatusCode::CONFLICT,
+            vec![("content-type".into(), "application/json".into())],
+            json!({ "error": reason, "gate": "open" }).to_string(),
+        ),
     }
 }
 
@@ -373,6 +448,7 @@ async fn discovery(State(app): State<Arc<AppState>>) -> Response {
             "feedback": "POST /feedback {identifier, category: goods-mismatch|advertising-mismatch|other:<stated>, contact?, details<=500} — the consumer report channel: journaled, sequenced, receipted; admission control is deployment-pluggable (rate window via UNIDPP_GATEWAY_FEEDBACK_RATE; refusals state their reason)",
             "feedback_citation": "GET /feedback/{seq} — the public citation form (contact withheld, stated)",
             "feedback_admin": "GET /admin/feedback?limit=&offset= — the full listing, admin-guarded when UNIDPP_GATEWAY_ADMIN_TOKEN is set",
+            "scan_tokens": "POST /scan-tokens {source} — issue a scan token when a scan policy is configured (X-UniDPP-Source honored); TTL + issuance limit are deployment data (unidpp-config scan_policy); absent policy = the gate is open (public resolution is the default doctrine); refusals state themselves (401 absent/unknown/expired, 429 over limit)",
             "health": "GET /healthz",
         },
         "bindings": {
@@ -428,9 +504,13 @@ async fn healthz() -> Response {
 /// GET /untp/product/{id} — the verifiable-credential triad + verdict.
 async fn untp_product(
     State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     Path(id): Path<String>,
 ) -> Response {
+    if let Err(reason) = app.scan.lock().expect("scan gate poisoned").admit(&headers) {
+        return crate::scan::refusal(&reason, false);
+    }
     let required_freshness = params
         .get("freshness")
         .map(|s| s.trim().to_string())
@@ -451,9 +531,13 @@ async fn untp_product(
 /// GET /en18222/v1/dppsByProductId/{gtin} — the EN 18222 REST render.
 async fn en18222_dpps(
     State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     Path(gtin): Path<String>,
 ) -> Response {
+    if let Err(reason) = app.scan.lock().expect("scan gate poisoned").admit(&headers) {
+        return crate::scan::refusal(&reason, false);
+    }
     let representation =
         match Representation::parse(params.get("representation").map(String::as_str)) {
             Ok(representation) => representation,
@@ -533,6 +617,7 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/untp/product/{id}", get(untp_product))
         .route("/untp/ingest", post(untp_ingest))
         .route("/en18222/v1/dppsByProductId/{gtin}", get(en18222_dpps))
+        .route("/scan-tokens", post(issue_scan_token))
         .route("/feedback", post(submit_feedback))
         .route("/feedback/{seq}", get(feedback_citation))
         .route("/admin/feedback", get(feedback_admin))

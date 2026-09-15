@@ -818,3 +818,87 @@ async fn feedback_is_journaled_receipted_and_rate_gated() {
 
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// The scan-token gate (TODO.impl 224 — deployment policy, enforced)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_scan_gate_states_itself_and_opens_under_policy() {
+    // Policy on: TTL 60 s, 2 issuances per source per minute.
+    let server = TestServer::spawn(Config {
+        scan_ttl_secs: 60,
+        scan_limit_per_minute: 2,
+        ..Config::default()
+    })
+    .await
+    .expect("spawn gateway");
+    let base = &server.base_url;
+
+    // No token: a stated 401 naming the policy and where to get one.
+    let resp = get(base, &format!("/untp/product/{LAPTOP_PRODUCT_ID}")).await;
+    assert_eq!(resp.status, 401);
+    assert!(resp.body_string().contains("scan token required"));
+    assert!(resp.body_string().contains("60 s"));
+
+    // Issuance is throttled and states itself; a live token opens the
+    // renders.
+    let resp = post_json(base, "/scan-tokens", &json!({"source": "test-a"})).await;
+    assert_eq!(resp.status, 201, "{}", resp.body_string());
+    let token = json_of(&resp)["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("scan-"));
+    let resp = json_request(
+        "GET",
+        &format!("{base}/untp/product/{LAPTOP_PRODUCT_ID}"),
+        None,
+        None,
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status, 401); // sanity: still gated without it
+    let resp = unidpp_gateway::http::request(
+        "GET",
+        &unidpp_gateway::http::Url::parse(&format!(
+            "{base}/untp/product/{LAPTOP_PRODUCT_ID}"
+        ))
+        .unwrap(),
+        &[("x-unidpp-scan".to_string(), token.clone())],
+        None,
+        TIMEOUT,
+    )
+    .await
+    .expect("tokened render");
+    assert_eq!(resp.status, 200);
+
+    // The EN 18222 render is gated the same way.
+    let resp = get(base, &format!("/en18222/v1/dppsByProductId/{TYRE_GTIN}")).await;
+    assert_eq!(resp.status, 401);
+
+    // Throttle: two issuances per source per minute, one already used.
+    assert_eq!(
+        post_json(base, "/scan-tokens", &json!({"source": "test-a"})).await.status,
+        201
+    );
+    let resp = post_json(base, "/scan-tokens", &json!({"source": "test-a"})).await;
+    assert_eq!(resp.status, 429);
+    assert!(resp.body_string().contains("issuance limit"));
+    // A different source has its own window.
+    assert_eq!(
+        post_json(base, "/scan-tokens", &json!({"source": "test-b"})).await.status,
+        201
+    );
+
+    server.stop().await;
+
+    // Policy off (the default doctrine: public resolution): open.
+    let open = spawn_fixtures().await;
+    let resp = get(&open.base_url, &format!("/untp/product/{LAPTOP_PRODUCT_ID}")).await;
+    assert_eq!(resp.status, 200);
+    // And issuance states that the gate is open.
+    let resp = post_json(&open.base_url, "/scan-tokens", &json!({"source": "x"})).await;
+    assert_eq!(resp.status, 409);
+    assert!(resp.body_string().contains("no scan policy"));
+    assert_eq!(json_of(&resp)["gate"], json!("open"));
+    open.stop().await;
+}
