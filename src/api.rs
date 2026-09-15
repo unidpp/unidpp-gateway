@@ -16,6 +16,10 @@
 //! | `GET /en18222/v1/dppsByProductId/{gtin}?representation=full\|compressed` | the EN 18222 REST render (default compressed, per the EN) |
 //! | `GET /healthz` | liveness |
 //! | `GET /` | discovery: both bindings documented as C4 protocol renderings |
+//! | `POST /feedback` | the consumer report channel (typed goods-mismatch/advertising-mismatch/other): journaled, receipted; admission control deployment-pluggable |
+//! | `GET /feedback/{seq}` | the public citation form (contact withheld, stated) |
+//! | `GET /admin/feedback?limit=&offset=` | the full listing (admin-guarded when a token is configured) |
+//! | `POST /scan-tokens` | issue a scan token under the configured scan policy (absent policy = the gate is open; refusals state themselves) |
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
