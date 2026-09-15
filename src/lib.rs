@@ -26,6 +26,7 @@
 pub mod api;
 pub mod canonical;
 pub mod en18222;
+pub mod feedback;
 pub mod fixtures;
 pub mod http;
 pub mod ingest;

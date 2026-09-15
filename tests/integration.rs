@@ -40,6 +40,10 @@ async fn get(base: &str, path: &str) -> HttpResponse {
         .expect("http request")
 }
 
+fn json_of(resp: &HttpResponse) -> Value {
+    serde_json::from_str(&resp.body_string()).expect("response JSON")
+}
+
 async fn post_json(base: &str, path: &str, body: &Value) -> HttpResponse {
     json_request(
         "POST",
@@ -717,5 +721,100 @@ async fn both_bindings_serve_the_same_core_state() {
         bare, en_identity,
         "both bindings serve the same core state — the identity matches across protocols"
     );
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The consumer report channel (TODO.impl 224 — MobileQR 投诉反馈)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn feedback_is_journaled_receipted_and_rate_gated() {
+    let server = TestServer::spawn(Config {
+        feedback_rate_per_minute: 2,
+        admin_token: Some("s3cret".to_string()),
+        ..Config::default()
+    })
+    .await
+    .expect("spawn gateway");
+    let base = &server.base_url;
+
+    // A typed report is admitted, journaled, and acknowledged with its
+    // sequence and instant — the receipt cites without the contact.
+    let body = json!({
+        "identifier": "gs1:(01)06901234567892",
+        "category": "goods-mismatch",
+        "contact": "reporter@example.org",
+        "details": "the package says 20 Ah, the page says 0.072 kWh"
+    });
+    let resp = post_json(base, "/feedback", &body).await;
+    assert_eq!(resp.status, 201, "{}", resp.body_string());
+    let receipt: Value = serde_json::from_str(&resp.body_string()).unwrap();
+    assert_eq!(receipt["seq"], json!(1));
+    assert_eq!(receipt["category"], json!("goods-mismatch"));
+    assert_eq!(receipt["contact"], json!("withheld"));
+    assert!(receipt["recorded_at"].as_str().is_some());
+
+    // The public citation form serves the report by sequence, contact
+    // withheld (stated, never silent).
+    let resp = get(base, "/feedback/1").await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(json_of(&resp)["contact"], json!("withheld"));
+    assert_eq!(json_of(&resp)["identifier"], json!("gs1:(01)06901234567892"));
+
+    // An unstated report is refused with a stated reason.
+    let resp = post_json(base, "/feedback", &json!({
+        "identifier": " ", "category": "goods-mismatch", "details": "x"
+    }))
+    .await;
+    assert_eq!(resp.status, 400);
+    assert!(resp.body_string().contains("`identifier` is required"));
+
+    // The admission gate: at most 2 per identifier per minute — the
+    // third is REFUSED WITH A STATED REASON (429), a different
+    // identifier is a different window.
+    let body2 = json!({
+        "identifier": "gs1:(01)06901234567892",
+        "category": "advertising-mismatch",
+        "details": "the ad claims Qi2, the page does not"
+    });
+    assert_eq!(post_json(base, "/feedback", &body2).await.status, 201);
+    let resp = post_json(base, "/feedback", &body2).await;
+    assert_eq!(resp.status, 429);
+    assert!(resp.body_string().contains("rate limit"));
+    let other = json!({
+        "identifier": "gs1:(01)09506000134352",
+        "category": "other:labelling",
+        "details": "the energy label class is unreadable"
+    });
+    assert_eq!(post_json(base, "/feedback", &other).await.status, 201);
+
+    // The admin listing carries the contacts; unguarded access is
+    // refused when a token is configured.
+    let resp = get(base, "/admin/feedback").await;
+    assert_eq!(resp.status, 401);
+    let resp = json_request(
+        "GET",
+        &format!("{base}/admin/feedback?limit=10"),
+        None,
+        Some("s3cret"),
+        TIMEOUT,
+    )
+    .await
+    .expect("admin listing");
+    assert_eq!(resp.status, 200);
+    let listing = json_of(&resp);
+    assert_eq!(listing["total"], json!(3));
+    assert_eq!(listing["records"][0]["identifier"], json!("gs1:(01)09506000134352"));
+    assert!(listing["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["contact"] == json!("reporter@example.org")));
+
+    // An unknown citation is a stated 404.
+    let resp = get(base, "/feedback/99").await;
+    assert_eq!(resp.status, 404);
+
     server.stop().await;
 }

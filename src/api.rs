@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
@@ -50,6 +50,15 @@ pub struct Config {
     pub issuer_url: Option<String>,
     /// Upstream request timeout.
     pub timeout: Duration,
+    /// The consumer-report journal path (`UNIDPP_GATEWAY_FEEDBACK_JOURNAL`);
+    /// absent = in-memory only (dev).
+    pub feedback_journal: Option<std::path::PathBuf>,
+    /// Per-identifier report rate limit (`UNIDPP_GATEWAY_FEEDBACK_RATE`,
+    /// reports per minute); 0/absent = permissive.
+    pub feedback_rate_per_minute: usize,
+    /// Admin bearer token (`UNIDPP_GATEWAY_ADMIN_TOKEN`) guarding the
+    /// report listing.
+    pub admin_token: Option<String>,
 }
 
 impl Default for Config {
@@ -58,6 +67,9 @@ impl Default for Config {
             bind: "127.0.0.1:8094".parse().expect("static bind"),
             issuer_url: None,
             timeout: Duration::from_secs(2),
+            feedback_journal: None,
+            feedback_rate_per_minute: 0,
+            admin_token: None,
         }
     }
 }
@@ -82,6 +94,24 @@ impl Config {
                 }
             }
         }
+        if let Ok(path) = std::env::var("UNIDPP_GATEWAY_FEEDBACK_JOURNAL") {
+            if !path.trim().is_empty() {
+                config.feedback_journal = Some(std::path::PathBuf::from(path));
+            }
+        }
+        if let Ok(rate) = std::env::var("UNIDPP_GATEWAY_FEEDBACK_RATE") {
+            match rate.trim().parse::<usize>() {
+                Ok(n) => config.feedback_rate_per_minute = n,
+                Err(_) => eprintln!(
+                    "unidpp-gateway: ignoring bad UNIDPP_GATEWAY_FEEDBACK_RATE `{rate}`"
+                ),
+            }
+        }
+        if let Ok(token) = std::env::var("UNIDPP_GATEWAY_ADMIN_TOKEN") {
+            if !token.trim().is_empty() {
+                config.admin_token = Some(token);
+            }
+        }
         if let Ok(ms) = std::env::var("UNIDPP_GATEWAY_TIMEOUT_MS") {
             match ms.trim().parse::<u64>() {
                 Ok(ms) => config.timeout = Duration::from_millis(ms),
@@ -102,17 +132,151 @@ pub struct AppState {
     pub source: PassportSource,
     /// Passports ingested from UNTP triads (`POST /untp/ingest`).
     pub ingested: std::sync::Mutex<crate::ingest::IngestStore>,
+    /// The consumer-report journal (TODO.impl 224).
+    pub feedback: std::sync::Mutex<crate::feedback::FeedbackStore>,
+    /// The pluggable admission gate in front of the report path.
+    pub admission: std::sync::Arc<dyn crate::feedback::AdmissionControl>,
 }
 
 impl AppState {
     /// Assemble state from a config.
     pub fn new(config: Config) -> AppState {
+        let admission: std::sync::Arc<dyn crate::feedback::AdmissionControl> =
+            if config.feedback_rate_per_minute > 0 {
+                std::sync::Arc::new(crate::feedback::RateLimited::per_minute(
+                    config.feedback_rate_per_minute,
+                ))
+            } else {
+                std::sync::Arc::new(crate::feedback::Permissive)
+            };
+        let feedback = crate::feedback::FeedbackStore::open(config.feedback_journal.as_deref())
+            .unwrap_or_else(|e| {
+                eprintln!("unidpp-gateway: feedback journal unavailable ({e}); in-memory only");
+                crate::feedback::FeedbackStore::open(None).expect("in-memory store")
+            });
         AppState {
             source: PassportSource::new(config.issuer_url.clone()),
             ingested: std::sync::Mutex::new(crate::ingest::IngestStore::new()),
+            feedback: std::sync::Mutex::new(feedback),
+            admission,
             config,
         }
     }
+}
+
+/// POST /feedback — the consumer report channel (TODO.impl 224):
+/// a stated report path on the public edge. The typed categories are
+/// MobileQR's two (goods-mismatch 实物不符 / advertising-mismatch 宣传
+/// 不符) plus a stated free-form other; admission control is the
+/// deployment's pluggable choice (a rate window here; captcha + SMS
+/// behind the same trait in a deployment that runs them); every
+/// admitted report is journaled and acknowledged with its sequence
+/// and instant.
+async fn submit_feedback(
+    State(app): State<Arc<AppState>>,
+    body: String,
+) -> Response {
+    let v: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => return bad_request(&format!("invalid JSON body: {e}")),
+    };
+    let report = crate::feedback::FeedbackReport {
+        identifier: v
+            .get("identifier")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        category: crate::feedback::FeedbackCategory::parse(
+            v.get("category").and_then(Value::as_str).unwrap_or(""),
+        ),
+        contact: v
+            .get("contact")
+            .and_then(Value::as_str)
+            .filter(|c| !c.trim().is_empty())
+            .map(str::to_string),
+        details: v
+            .get("details")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    };
+    if let Err(reason) = app.admission.admit(&report) {
+        return build_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![("content-type".into(), "application/json".into())],
+            json!({ "error": reason, "refused": true }).to_string(),
+        );
+    }
+    let now = Timestamp::now().to_string();
+    let rec = {
+        let mut feedback = app.feedback.lock().expect("feedback store poisoned");
+        match feedback.submit(report, &now) {
+            Ok(rec) => rec,
+            Err(e) => return bad_request(&e),
+        }
+    };
+    build_response(
+        StatusCode::CREATED,
+        vec![("content-type".into(), "application/json".into())],
+        rec.to_json(false).to_string(),
+    )
+}
+
+/// GET /feedback/{seq} — the public citation form: the report by
+/// sequence with the contact withheld (stated, never silent).
+async fn feedback_citation(Path(seq): Path<u64>, State(app): State<Arc<AppState>>) -> Response {
+    let doc = {
+        let feedback = app.feedback.lock().expect("feedback store poisoned");
+        feedback.get(seq)
+    };
+    match doc {
+        Some(doc) => build_response(
+            StatusCode::OK,
+            vec![("content-type".into(), "application/json".into())],
+            serde_json::to_string_pretty(&doc).unwrap(),
+        ),
+        None => not_found(),
+    }
+}
+
+/// GET /admin/feedback?limit&offset — the full listing (contacts
+/// included), newest first, admin-guarded when a token is configured.
+async fn feedback_admin(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(token) = &app.config.admin_token {
+        let got = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if got != Some(token.as_str()) {
+            return build_response(
+                StatusCode::UNAUTHORIZED,
+                vec![("content-type".into(), "application/json".into())],
+                "{\"error\":\"unauthorized\"}".to_string(),
+            );
+        }
+    }
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(10_000);
+    let offset = params
+        .get("offset")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let doc = {
+        let feedback = app.feedback.lock().expect("feedback store poisoned");
+        feedback.list_json(limit, offset)
+    };
+    build_response(
+        StatusCode::OK,
+        vec![("content-type".into(), "application/json".into())],
+        serde_json::to_string_pretty(&doc).unwrap(),
+    )
 }
 
 /// Resolve a passport from any serving source: fixtures, the issuer
@@ -206,6 +370,9 @@ async fn discovery(State(app): State<Arc<AppState>>) -> Response {
             "untp": "GET /untp/product/{id}?freshness=",
             "untp_ingest": "POST /untp/ingest (import direction: a UNTP passport VC or triad mints a core passport with a deterministic identity; idempotent per subject)",
             "en18222": "GET /en18222/v1/dppsByProductId/{gtin}?representation=full|compressed",
+            "feedback": "POST /feedback {identifier, category: goods-mismatch|advertising-mismatch|other:<stated>, contact?, details<=500} — the consumer report channel: journaled, sequenced, receipted; admission control is deployment-pluggable (rate window via UNIDPP_GATEWAY_FEEDBACK_RATE; refusals state their reason)",
+            "feedback_citation": "GET /feedback/{seq} — the public citation form (contact withheld, stated)",
+            "feedback_admin": "GET /admin/feedback?limit=&offset= — the full listing, admin-guarded when UNIDPP_GATEWAY_ADMIN_TOKEN is set",
             "health": "GET /healthz",
         },
         "bindings": {
@@ -366,6 +533,9 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/untp/product/{id}", get(untp_product))
         .route("/untp/ingest", post(untp_ingest))
         .route("/en18222/v1/dppsByProductId/{gtin}", get(en18222_dpps))
+        .route("/feedback", post(submit_feedback))
+        .route("/feedback/{seq}", get(feedback_citation))
+        .route("/admin/feedback", get(feedback_admin))
         .with_state(app)
 }
 
