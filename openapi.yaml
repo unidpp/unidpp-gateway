@@ -1,0 +1,239 @@
+components: {}
+info:
+  description: 'The cross-regime gateway: it renders the neutral core in foreign protocol shapes (UNTP verifiable credentials, the EN 18222 REST shape), imports those shapes back with a deterministic identity, and operates the consumer-facing surfaces (the report channel and the scan-policy gate). As-of stamped responses; no-information 404s (I12).'
+  license:
+    identifier: Apache-2.0
+    name: Apache-2.0
+  title: UniDPP gateway
+  version: 0.1.0
+  x-unidpp-env-keys:
+  - UNIDPP_GATEWAY_BIND
+  - UNIDPP_ISSUER_URL
+  - UNIDPP_GATEWAY_ISSUER_URL
+  - UNIDPP_GATEWAY_FEEDBACK_JOURNAL
+  - UNIDPP_GATEWAY_FEEDBACK_RATE
+  - UNIDPP_GATEWAY_ADMIN_TOKEN
+  - UNIDPP_GATEWAY_SCAN_TTL_SECS
+  - UNIDPP_GATEWAY_SCAN_LIMIT_PER_MIN
+  - UNIDPP_GATEWAY_TIMEOUT_MS
+openapi: 3.1.0
+paths:
+  /:
+    get:
+      operationId: discovery
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The discovery document: the served profiles, their endpoint references, the source posture and the response conventions'
+      summary: Serve the discovery document.
+      tags:
+      - gateway
+  /admin/feedback:
+    get:
+      operationId: feedback_admin
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The listing of filed reports
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: |-
+        GET /admin/feedback?limit&offset — the full listing (contacts
+        included), newest first, admin-guarded when a token is configured.
+        The operator's window onto the report channel.
+      tags:
+      - admin
+  /en18222/v1/dppsByProductId/{gtin}:
+    get:
+      operationId: en18222_dpps
+      parameters:
+      - description: The GTIN
+        in: path
+        name: gtin
+        required: true
+        schema:
+          type: string
+      - description: '`full` (element tree, string-printed values) or `compressed` (collection-keyed, native JSON values; the default)'
+        in: query
+        name: rendering
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The EN 18222 document, as-of stamped
+        '404':
+          description: The no-information 404 (I12)
+      summary: |-
+        GET /en18222/v1/dppsByProductId/{gtin} — the EN 18222 REST render.
+        Render passports for a GTIN in the EN 18222 REST shape (full or
+        compressed; the default is compressed per the EN).
+      tags:
+      - gateway
+  /feedback:
+    post:
+      operationId: submit_feedback
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: 'The report: its type, the subject identifier and the statement'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Filed; the receipt carries the sequence number that cites it
+        '400':
+          description: An unparseable or mistyped report
+        '429':
+          description: The admission control refused the report as a flood
+      summary: |-
+        POST /feedback — the consumer report channel (TODO.impl 224):
+        a stated report path on the public edge. The typed categories are
+        MobileQR's two (goods-mismatch 实物不符 / advertising-mismatch 宣传
+        不符) plus a stated free-form other; admission control is the
+        deployment's pluggable choice (a rate window here; captcha + SMS
+        behind the same trait in a deployment that runs them); every
+        admitted report is journaled and acknowledged with its sequence
+        and instant.
+        File a consumer report through the report channel (typed,
+        journaled, receipted; the pluggable admission control decides
+        what a flood is).
+      tags:
+      - gateway
+  /feedback/{seq}:
+    get:
+      operationId: feedback_citation
+      parameters:
+      - description: The receipt sequence number
+        in: path
+        name: seq
+        required: true
+        schema:
+          format: int64
+          minimum: 0
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The report, byte-identical on every read
+        '404':
+          description: No report carries this sequence number
+      summary: |-
+        GET /feedback/{seq} — the public citation form: the report by
+        sequence with the contact withheld (stated, never silent).
+        Retrieve one filed report by its receipt sequence number.
+      tags:
+      - gateway
+  /healthz:
+    get:
+      operationId: healthz
+      responses:
+        '200':
+          description: The service is serving
+      summary: Liveness probe.
+      tags:
+      - gateway
+  /scan-tokens:
+    post:
+      operationId: issue_scan_token
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The issuance request under the deployment's scan policy (rate and ttl are manifest data)
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Issued; the token and its expiry are stated
+        '401':
+          description: The issuance credential is required and absent
+        '429':
+          description: The policy's per-minute limit is reached
+      summary: |-
+        POST /scan-tokens {source} — issue a scan token under the
+        configured policy (the gate states where the policy came from; no
+        policy configured = the gate is open and issuance is a stated
+        no-op). The source names the requester in production set by the
+        fronting proxy (X-UniDPP-Source is accepted here).
+        Issue a scan token (the scan-policy gate: a scan-gated deployment
+        answers unauthenticated mark reads with a stated 401 naming this
+        endpoint; absent policy, reads are free).
+      tags:
+      - gateway
+  /untp/ingest:
+    post:
+      operationId: untp_ingest
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The UNTP document to import
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: Matched (the subject already exists; the import is an identity)
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Imported (new subject)
+        '422':
+          description: The document is well-formed JSON but not a conforming UNTP rendering
+      summary: |-
+        POST /untp/ingest — the import direction: a UNTP passport VC (bare
+        or the triad this gateway renders) mints a neutral-core passport
+        with a deterministic identity; conformity credentials land as
+        profile bindings. Idempotent per subject identity.
+        Ingest a UNTP document back into the neutral core (render and
+        ingest are inverse projections; imported documents carry an empty
+        log and the receipt records the origin).
+      tags:
+      - gateway
+  /untp/product/{id}:
+    get:
+      operationId: untp_product
+      parameters:
+      - description: The product identifier (core cpid or GS1 family element string)
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The UNTP triad, as-of stamped
+        '404':
+          description: 'The no-information 404: identical bytes for unknown and deliberately unresolvable ids (I12)'
+      summary: |-
+        GET /untp/product/{id} — the verifiable-credential triad + verdict.
+        Render one passport in the UNTP verifiable-credential triad
+        (DigitalProductPassport VC + DigitalConformityCredentials + the
+        link-resolver entry) — one neutral core, a C4 protocol rendering.
+      tags:
+      - gateway
+tags:
+- description: Protocol renderings, the report channel and the scan-policy gate
+  name: gateway
+- description: The operator surface over the report channel
+  name: admin

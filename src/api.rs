@@ -33,6 +33,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 use unidpp_model::Timestamp;
 
 use crate::en18222::{self, Representation};
@@ -87,9 +89,32 @@ impl Default for Config {
 
 impl Config {
     /// Resolve configuration from environment variables.
+    /// The environment variables this service consumes. This is the
+    /// deployment contract: unidpp-config renders exactly these names
+    /// for the gateway, and the contract document carries them as
+    /// `x-unidpp-env-keys`. `UNIDPP_ISSUER_URL` and its service-scoped
+    /// alias name one setting (the task-facing name wins).
+    pub const ENV_KEYS: &'static [&'static str] = &[
+        "UNIDPP_GATEWAY_BIND",
+        "UNIDPP_ISSUER_URL",
+        "UNIDPP_GATEWAY_ISSUER_URL",
+        "UNIDPP_GATEWAY_FEEDBACK_JOURNAL",
+        "UNIDPP_GATEWAY_FEEDBACK_RATE",
+        "UNIDPP_GATEWAY_ADMIN_TOKEN",
+        "UNIDPP_GATEWAY_SCAN_TTL_SECS",
+        "UNIDPP_GATEWAY_SCAN_LIMIT_PER_MIN",
+        "UNIDPP_GATEWAY_TIMEOUT_MS",
+    ];
+
     pub fn from_env() -> Config {
         let mut config = Config::default();
-        if let Ok(bind) = std::env::var("UNIDPP_GATEWAY_BIND") {
+        let mut vars: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+        for key in Self::ENV_KEYS {
+            if let Ok(value) = std::env::var(key) {
+                vars.insert(*key, value);
+            }
+        }
+        if let Some(bind) = vars.get("UNIDPP_GATEWAY_BIND") {
             match bind.parse() {
                 Ok(addr) => config.bind = addr,
                 Err(_) => eprintln!("unidpp-gateway: ignoring bad UNIDPP_GATEWAY_BIND `{bind}`"),
@@ -98,19 +123,19 @@ impl Config {
         // The task-facing name is UNIDPP_ISSUER_URL; the service-
         // scoped alias keeps the house naming convention available.
         for key in ["UNIDPP_ISSUER_URL", "UNIDPP_GATEWAY_ISSUER_URL"] {
-            if let Ok(url) = std::env::var(key) {
+            if let Some(url) = vars.get(key) {
                 if !url.trim().is_empty() {
-                    config.issuer_url = Some(url);
+                    config.issuer_url = Some(url.clone());
                     break;
                 }
             }
         }
-        if let Ok(path) = std::env::var("UNIDPP_GATEWAY_FEEDBACK_JOURNAL") {
+        if let Some(path) = vars.get("UNIDPP_GATEWAY_FEEDBACK_JOURNAL") {
             if !path.trim().is_empty() {
                 config.feedback_journal = Some(std::path::PathBuf::from(path));
             }
         }
-        if let Ok(rate) = std::env::var("UNIDPP_GATEWAY_FEEDBACK_RATE") {
+        if let Some(rate) = vars.get("UNIDPP_GATEWAY_FEEDBACK_RATE") {
             match rate.trim().parse::<usize>() {
                 Ok(n) => config.feedback_rate_per_minute = n,
                 Err(_) => eprintln!(
@@ -118,12 +143,12 @@ impl Config {
                 ),
             }
         }
-        if let Ok(token) = std::env::var("UNIDPP_GATEWAY_ADMIN_TOKEN") {
+        if let Some(token) = vars.get("UNIDPP_GATEWAY_ADMIN_TOKEN") {
             if !token.trim().is_empty() {
-                config.admin_token = Some(token);
+                config.admin_token = Some(token.clone());
             }
         }
-        if let Ok(ttl) = std::env::var("UNIDPP_GATEWAY_SCAN_TTL_SECS") {
+        if let Some(ttl) = vars.get("UNIDPP_GATEWAY_SCAN_TTL_SECS") {
             match ttl.trim().parse::<u64>() {
                 Ok(t) => config.scan_ttl_secs = t,
                 Err(_) => {
@@ -131,7 +156,7 @@ impl Config {
                 }
             }
         }
-        if let Ok(limit) = std::env::var("UNIDPP_GATEWAY_SCAN_LIMIT_PER_MIN") {
+        if let Some(limit) = vars.get("UNIDPP_GATEWAY_SCAN_LIMIT_PER_MIN") {
             match limit.trim().parse::<usize>() {
                 Ok(n) => config.scan_limit_per_minute = n,
                 Err(_) => eprintln!(
@@ -139,7 +164,7 @@ impl Config {
                 ),
             }
         }
-        if let Ok(ms) = std::env::var("UNIDPP_GATEWAY_TIMEOUT_MS") {
+        if let Some(ms) = vars.get("UNIDPP_GATEWAY_TIMEOUT_MS") {
             match ms.trim().parse::<u64>() {
                 Ok(ms) => config.timeout = Duration::from_millis(ms),
                 Err(_) => {
@@ -204,6 +229,21 @@ impl AppState {
 /// policy configured = the gate is open and issuance is a stated
 /// no-op). The source names the requester in production set by the
 /// fronting proxy (X-UniDPP-Source is accepted here).
+/// Issue a scan token (the scan-policy gate: a scan-gated deployment
+/// answers unauthenticated mark reads with a stated 401 naming this
+/// endpoint; absent policy, reads are free).
+#[utoipa::path(
+    post,
+    path = "/scan-tokens",
+    tag = "gateway",
+    request_body(content = Value, description = "The issuance request under the deployment's scan policy (rate and ttl are manifest data)"),
+    responses(
+        (status = 201, description = "Issued; the token and its expiry are stated", body = Value, content_type = "application/json"),
+        (status = 401, description = "The issuance credential is required and absent"),
+        (status = 429, description = "The policy's per-minute limit is reached"),
+    )
+)]
+
 async fn issue_scan_token(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -251,6 +291,21 @@ async fn issue_scan_token(
 /// behind the same trait in a deployment that runs them); every
 /// admitted report is journaled and acknowledged with its sequence
 /// and instant.
+/// File a consumer report through the report channel (typed,
+/// journaled, receipted; the pluggable admission control decides
+/// what a flood is).
+#[utoipa::path(
+    post,
+    path = "/feedback",
+    tag = "gateway",
+    request_body(content = Value, description = "The report: its type, the subject identifier and the statement"),
+    responses(
+        (status = 201, description = "Filed; the receipt carries the sequence number that cites it", body = Value, content_type = "application/json"),
+        (status = 400, description = "An unparseable or mistyped report"),
+        (status = 429, description = "The admission control refused the report as a flood"),
+    )
+)]
+
 async fn submit_feedback(
     State(app): State<Arc<AppState>>,
     body: String,
@@ -303,6 +358,18 @@ async fn submit_feedback(
 
 /// GET /feedback/{seq} — the public citation form: the report by
 /// sequence with the contact withheld (stated, never silent).
+/// Retrieve one filed report by its receipt sequence number.
+#[utoipa::path(
+    get,
+    path = "/feedback/{seq}",
+    tag = "gateway",
+    params(("seq" = u64, Path, description = "The receipt sequence number")),
+    responses(
+        (status = 200, description = "The report, byte-identical on every read", body = Value, content_type = "application/json"),
+        (status = 404, description = "No report carries this sequence number"),
+    )
+)]
+
 async fn feedback_citation(Path(seq): Path<u64>, State(app): State<Arc<AppState>>) -> Response {
     let doc = {
         let feedback = app.feedback.lock().expect("feedback store poisoned");
@@ -320,6 +387,17 @@ async fn feedback_citation(Path(seq): Path<u64>, State(app): State<Arc<AppState>
 
 /// GET /admin/feedback?limit&offset — the full listing (contacts
 /// included), newest first, admin-guarded when a token is configured.
+/// The operator's window onto the report channel.
+#[utoipa::path(
+    get,
+    path = "/admin/feedback",
+    tag = "admin",
+    responses(
+        (status = 200, description = "The listing of filed reports", body = Value, content_type = "application/json"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
+
 async fn feedback_admin(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -436,6 +514,16 @@ fn not_found() -> Response {
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Serve the discovery document.
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "gateway",
+    responses(
+        (status = 200, description = "The discovery document: the served profiles, their endpoint references, the source posture and the response conventions", body = Value, content_type = "application/json"),
+    )
+)]
+
 async fn discovery(State(app): State<Arc<AppState>>) -> Response {
     let doc = json!({
         "service": "unidpp-gateway",
@@ -494,6 +582,16 @@ async fn discovery(State(app): State<Arc<AppState>>) -> Response {
     stamped(StatusCode::OK, &doc, Timestamp::now())
 }
 
+/// Liveness probe.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "gateway",
+    responses(
+        (status = 200, description = "The service is serving"),
+    )
+)]
+
 async fn healthz() -> Response {
     build_response(
         StatusCode::OK,
@@ -506,6 +604,20 @@ async fn healthz() -> Response {
 }
 
 /// GET /untp/product/{id} — the verifiable-credential triad + verdict.
+/// Render one passport in the UNTP verifiable-credential triad
+/// (DigitalProductPassport VC + DigitalConformityCredentials + the
+/// link-resolver entry) — one neutral core, a C4 protocol rendering.
+#[utoipa::path(
+    get,
+    path = "/untp/product/{id}",
+    tag = "gateway",
+    params(("id" = String, Path, description = "The product identifier (core cpid or GS1 family element string)")),
+    responses(
+        (status = 200, description = "The UNTP triad, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "The no-information 404: identical bytes for unknown and deliberately unresolvable ids (I12)"),
+    )
+)]
+
 async fn untp_product(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -533,6 +645,22 @@ async fn untp_product(
 }
 
 /// GET /en18222/v1/dppsByProductId/{gtin} — the EN 18222 REST render.
+/// Render passports for a GTIN in the EN 18222 REST shape (full or
+/// compressed; the default is compressed per the EN).
+#[utoipa::path(
+    get,
+    path = "/en18222/v1/dppsByProductId/{gtin}",
+    tag = "gateway",
+    params(
+        ("gtin" = String, Path, description = "The GTIN"),
+        ("rendering" = Option<String>, Query, description = "`full` (element tree, string-printed values) or `compressed` (collection-keyed, native JSON values; the default)"),
+    ),
+    responses(
+        (status = 200, description = "The EN 18222 document, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "The no-information 404 (I12)"),
+    )
+)]
+
 async fn en18222_dpps(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -559,6 +687,21 @@ async fn en18222_dpps(
 /// or the triad this gateway renders) mints a neutral-core passport
 /// with a deterministic identity; conformity credentials land as
 /// profile bindings. Idempotent per subject identity.
+/// Ingest a UNTP document back into the neutral core (render and
+/// ingest are inverse projections; imported documents carry an empty
+/// log and the receipt records the origin).
+#[utoipa::path(
+    post,
+    path = "/untp/ingest",
+    tag = "gateway",
+    request_body(content = Value, description = "The UNTP document to import"),
+    responses(
+        (status = 201, description = "Imported (new subject)", body = Value, content_type = "application/json"),
+        (status = 200, description = "Matched (the subject already exists; the import is an identity)", body = Value, content_type = "application/json"),
+        (status = 422, description = "The document is well-formed JSON but not a conforming UNTP rendering"),
+    )
+)]
+
 async fn untp_ingest(State(app): State<Arc<AppState>>, body: String) -> Response {
     let stub: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -614,17 +757,81 @@ async fn untp_ingest(State(app): State<Arc<AppState>>, body: String) -> Response
 // Route wiring
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Interface contract
+// ---------------------------------------------------------------------------
+
+/// The routed paths, declared once. The router routes by these
+/// constants, the contract document is tested against them, and no
+/// route may be declared with a raw literal (the gates enforce both).
+pub mod paths {
+    pub const ROOT: &str = "/";
+    pub const HEALTHZ: &str = "/healthz";
+    pub const UNTP_PRODUCT: &str = "/untp/product/{id}";
+    pub const UNTP_INGEST: &str = "/untp/ingest";
+    pub const EN18222_DPPS: &str = "/en18222/v1/dppsByProductId/{gtin}";
+    pub const SCAN_TOKENS: &str = "/scan-tokens";
+    pub const FEEDBACK: &str = "/feedback";
+    pub const FEEDBACK_CITATION: &str = "/feedback/{seq}";
+    pub const ADMIN_FEEDBACK: &str = "/admin/feedback";
+    /// The contract document itself (not an operation of the API).
+    pub const CONTRACT_YAML: &str = "/openapi.yaml";
+}
+
+/// The OpenAPI model: one declaration per handler (`#[utoipa::path]`),
+/// from which the served contract, the golden file and Swagger UI all
+/// derive.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "UniDPP gateway",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "The cross-regime gateway: it renders the neutral core in foreign protocol shapes (UNTP verifiable credentials, the EN 18222 REST shape), imports those shapes back with a deterministic identity, and operates the consumer-facing surfaces (the report channel and the scan-policy gate). As-of stamped responses; no-information 404s (I12).",
+        license(name = "Apache-2.0", identifier = "Apache-2.0"),
+    ),
+    paths(
+        discovery, healthz, untp_product, untp_ingest, en18222_dpps,
+        issue_scan_token, submit_feedback, feedback_citation, feedback_admin,
+    ),
+    tags(
+        (name = "gateway", description = "Protocol renderings, the report channel and the scan-policy gate"),
+        (name = "admin", description = "The operator surface over the report channel"),
+    )
+)]
+struct ApiDoc;
+
+/// The contract document: the OpenAPI model plus the deployment keys
+/// (`x-unidpp-env-keys`). Served at `/openapi.yaml` and committed as
+/// the golden `openapi.yaml`.
+pub fn contract_yaml() -> String {
+    let mut doc = serde_json::to_value(ApiDoc::openapi()).expect("contract serializes");
+    doc["info"]["x-unidpp-env-keys"] = json!(Config::ENV_KEYS);
+    serde_yaml::to_string(&doc).expect("contract renders as YAML")
+}
+
+async fn openapi_yaml() -> Response {
+    build_response(
+        StatusCode::OK,
+        vec![
+            ("content-type".to_string(), "application/yaml".to_string()),
+        ],
+        contract_yaml(),
+    )
+}
+
 pub fn router(app: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(discovery))
-        .route("/healthz", get(healthz))
-        .route("/untp/product/{id}", get(untp_product))
-        .route("/untp/ingest", post(untp_ingest))
-        .route("/en18222/v1/dppsByProductId/{gtin}", get(en18222_dpps))
-        .route("/scan-tokens", post(issue_scan_token))
-        .route("/feedback", post(submit_feedback))
-        .route("/feedback/{seq}", get(feedback_citation))
-        .route("/admin/feedback", get(feedback_admin))
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .route(paths::ROOT, get(discovery))
+        .route(paths::HEALTHZ, get(healthz))
+        .route(paths::UNTP_PRODUCT, get(untp_product))
+        .route(paths::UNTP_INGEST, post(untp_ingest))
+        .route(paths::EN18222_DPPS, get(en18222_dpps))
+        .route(paths::SCAN_TOKENS, post(issue_scan_token))
+        .route(paths::FEEDBACK, post(submit_feedback))
+        .route(paths::FEEDBACK_CITATION, get(feedback_citation))
+        .route(paths::ADMIN_FEEDBACK, get(feedback_admin))
+        .route(paths::CONTRACT_YAML, get(openapi_yaml))
         .with_state(app)
 }
 
@@ -707,5 +914,184 @@ mod tests {
         let doc: Value = serde_json::from_str(&response.body_string()).unwrap();
         assert_eq!(doc["service"], "unidpp-gateway");
         server.stop().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contract gates
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod contract_gates {
+    use super::*;
+    use crate::http::{request, Url};
+    use std::time::Duration;
+
+    const VERBS: [&str; 5] = ["get", "post", "put", "delete", "patch"];
+
+    /// The contract paths with their documented methods.
+    fn documented() -> std::collections::BTreeMap<String, Vec<String>> {
+        let doc: Value = serde_yaml::from_str(&contract_yaml()).expect("contract parses");
+        doc["paths"]
+            .as_object()
+            .expect("paths object")
+            .iter()
+            .map(|(path, item)| {
+                let methods = VERBS
+                    .iter()
+                    .filter(|v| item.get(*v).is_some())
+                    .map(|v| v.to_string())
+                    .collect();
+                (path.clone(), methods)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_golden_matches_the_committed_contract() {
+        assert_eq!(contract_yaml(), include_str!("../openapi.yaml"));
+    }
+
+    #[test]
+    #[ignore = "regenerates openapi.yaml after a route change: cargo test contract_gates -- --ignored export"]
+    fn export_golden() {
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"),
+            contract_yaml(),
+        )
+        .expect("golden written");
+    }
+
+    /// Every path the router serves (the contract route itself
+    /// carries no operation).
+    fn routed_paths() -> Vec<&'static str> {
+        vec![
+            paths::ROOT,
+            paths::HEALTHZ,
+            paths::UNTP_PRODUCT,
+            paths::UNTP_INGEST,
+            paths::EN18222_DPPS,
+            paths::SCAN_TOKENS,
+            paths::FEEDBACK,
+            paths::FEEDBACK_CITATION,
+            paths::ADMIN_FEEDBACK,
+        ]
+    }
+
+    #[test]
+    fn every_routed_path_is_documented() {
+        let doc = documented();
+        for path in routed_paths() {
+            assert!(doc.contains_key(path), "routed but undocumented: {path}");
+        }
+    }
+
+    #[test]
+    fn every_documented_path_is_routed() {
+        let routed: std::collections::BTreeSet<String> =
+            routed_paths().into_iter().map(str::to_string).collect();
+        for path in documented().keys() {
+            assert!(routed.contains(path), "documented but not routed: {path}");
+        }
+    }
+
+    #[test]
+    fn routes_are_declared_by_constant_not_literal() {
+        let flat: String = include_str!("api.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut idx = 0;
+        while let Some(pos) = flat[idx..].find(".route(") {
+            let abs = idx + pos;
+            if abs > 0 && flat.as_bytes()[abs - 1] == b'"' {
+                idx = abs + 7;
+                continue;
+            }
+            let after = flat[abs + 7..].trim_start();
+            assert!(
+                after.starts_with("paths::"),
+                "route paths come from the paths:: constants: `{}`",
+                &flat[abs..(abs + 60).min(flat.len())]
+            );
+            idx = abs + 7;
+        }
+    }
+
+    /// The `VERB /path` endpoint references embedded in the discovery
+    /// document must all be contracted operations.
+    #[tokio::test]
+    async fn discovery_names_only_contracted_endpoints() {
+        let ts = TestServer::spawn(Config::default()).await.expect("server");
+        let resp = request(
+            "GET",
+            &Url::parse(&format!("{}/", ts.base_url)).expect("url"),
+            &[],
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("discovery answered");
+        ts.stop().await;
+        let body = resp.body_string();
+        let documented: Vec<String> = documented().into_keys().collect();
+        for verb in VERBS.map(str::to_uppercase) {
+            let mut rest = body.as_str();
+            while let Some(pos) = rest.find(&verb) {
+                let after = &rest[pos + verb.len()..];
+                rest = after;
+                let Some(path) = after.strip_prefix(" /") else {
+                    continue;
+                };
+                let taken: String = path
+                    .chars()
+                    .take_while(|c| !matches!(c, ' ' | '"' | '<'))
+                    .collect();
+                let path = taken.split('?').next().unwrap_or("").to_string();
+                if path.is_empty() {
+                    continue;
+                }
+                assert!(
+                    documented.contains(&format!("/{path}")),
+                    "discovery names `{verb} /{path}` — no such operation in the contract"
+                );
+            }
+        }
+    }
+
+    /// The behavioral half: every documented operation answers
+    /// anything but 405, and every undocumented method on a documented
+    /// path answers 405 — on the live router.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_router_serves_the_contract_exactly() {
+        let ts = TestServer::spawn(Config::default())
+            .await
+            .expect("test server");
+        for (path, methods) in documented() {
+            let concrete = path.replace("{id}", "probe-x").replace("{seq}", "1").replace("{gtin}", "09999999999994");
+            for verb in VERBS {
+                let resp = request(
+                    &verb.to_uppercase(),
+                    &Url::parse(&format!("{}{concrete}", ts.base_url)).expect("probe url"),
+                    &[],
+                    if verb == "get" { None } else { Some(b"{}".as_slice()) },
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("probe answered");
+                if methods.contains(&verb.to_string()) {
+                    assert_ne!(
+                        resp.status, 405,
+                        "{verb} {concrete}: the contract says routed, the router says otherwise"
+                    );
+                } else {
+                    assert_eq!(
+                        resp.status, 405,
+                        "{verb} {concrete}: served but not in the contract"
+                    );
+                }
+            }
+        }
+        ts.stop().await;
     }
 }
