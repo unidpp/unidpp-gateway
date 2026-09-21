@@ -68,7 +68,10 @@ impl ScanGate {
             return Err("no scan policy is configured — the gate is open, no token needed".into());
         }
         let now = Instant::now();
-        let window = self.issued_per_source.entry(source.to_string()).or_default();
+        let window = self
+            .issued_per_source
+            .entry(source.to_string())
+            .or_default();
         while window
             .front()
             .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
@@ -159,10 +162,7 @@ mod tests {
     fn headers(token: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();
         if let Some(t) = token {
-            h.insert(
-                "x-unidpp-scan",
-                t.parse().expect("header value"),
-            );
+            h.insert("x-unidpp-scan", t.parse().expect("header value"));
         }
         h
     }
@@ -188,7 +188,10 @@ mod tests {
         assert!(err.contains("scan token required"), "{err}");
         assert!(err.contains("60 s"), "{err}");
         // Unknown token.
-        assert!(gate.admit(&headers(Some("scan-nope"))).unwrap_err().contains("unknown"));
+        assert!(gate
+            .admit(&headers(Some("scan-nope")))
+            .unwrap_err()
+            .contains("unknown"));
         // Live token admits.
         let (token, ttl) = gate.issue("source-a").unwrap();
         assert_eq!(ttl, 60);
@@ -196,7 +199,10 @@ mod tests {
         // Throttle: two more for the same source refuse (limit 2/min,
         // one already used).
         assert!(gate.issue("source-a").is_ok());
-        assert!(gate.issue("source-a").unwrap_err().contains("issuance limit"));
+        assert!(gate
+            .issue("source-a")
+            .unwrap_err()
+            .contains("issuance limit"));
         // A different source has its own window.
         assert!(gate.issue("source-b").is_ok());
     }
@@ -216,6 +222,9 @@ mod tests {
         let err = gate.admit(&headers(Some(&token))).unwrap_err();
         assert!(err.contains("scan token expired"), "{err}");
         // And the expired token is gone afterwards.
-        assert!(gate.admit(&headers(Some(&token))).unwrap_err().contains("unknown"));
+        assert!(gate
+            .admit(&headers(Some(&token)))
+            .unwrap_err()
+            .contains("unknown"));
     }
 }

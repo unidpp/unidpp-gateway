@@ -33,9 +33,9 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use unidpp_model::Timestamp;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-use unidpp_model::Timestamp;
 
 use crate::en18222::{self, Representation};
 use crate::source::PassportSource;
@@ -138,9 +138,9 @@ impl Config {
         if let Some(rate) = vars.get("UNIDPP_GATEWAY_FEEDBACK_RATE") {
             match rate.trim().parse::<usize>() {
                 Ok(n) => config.feedback_rate_per_minute = n,
-                Err(_) => eprintln!(
-                    "unidpp-gateway: ignoring bad UNIDPP_GATEWAY_FEEDBACK_RATE `{rate}`"
-                ),
+                Err(_) => {
+                    eprintln!("unidpp-gateway: ignoring bad UNIDPP_GATEWAY_FEEDBACK_RATE `{rate}`")
+                }
             }
         }
         if let Some(token) = vars.get("UNIDPP_GATEWAY_ADMIN_TOKEN") {
@@ -213,12 +213,10 @@ impl AppState {
             ingested: std::sync::Mutex::new(crate::ingest::IngestStore::new()),
             feedback: std::sync::Mutex::new(feedback),
             admission,
-            scan: std::sync::Mutex::new(crate::scan::ScanGate::new(
-                crate::scan::ScanPolicy {
-                    token_ttl_secs: config.scan_ttl_secs,
-                    issue_limit_per_minute: config.scan_limit_per_minute,
-                },
-            )),
+            scan: std::sync::Mutex::new(crate::scan::ScanGate::new(crate::scan::ScanPolicy {
+                token_ttl_secs: config.scan_ttl_secs,
+                issue_limit_per_minute: config.scan_limit_per_minute,
+            })),
             config,
         }
     }
@@ -259,11 +257,7 @@ async fn issue_scan_token(
                 .and_then(|v| v.get("source").and_then(Value::as_str).map(str::to_string))
         })
         .unwrap_or_else(|| "anonymous".to_string());
-    let issued = app
-        .scan
-        .lock()
-        .expect("scan gate poisoned")
-        .issue(&source);
+    let issued = app.scan.lock().expect("scan gate poisoned").issue(&source);
     match issued {
         Ok((token, ttl)) => build_response(
             StatusCode::CREATED,
@@ -306,10 +300,7 @@ async fn issue_scan_token(
     )
 )]
 
-async fn submit_feedback(
-    State(app): State<Arc<AppState>>,
-    body: String,
-) -> Response {
+async fn submit_feedback(State(app): State<Arc<AppState>>, body: String) -> Response {
     let v: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => return bad_request(&format!("invalid JSON body: {e}")),
@@ -812,9 +803,7 @@ pub fn contract_yaml() -> String {
 async fn openapi_yaml() -> Response {
     build_response(
         StatusCode::OK,
-        vec![
-            ("content-type".to_string(), "application/yaml".to_string()),
-        ],
+        vec![("content-type".to_string(), "application/yaml".to_string())],
         contract_yaml(),
     )
 }
@@ -1068,13 +1057,20 @@ mod contract_gates {
             .await
             .expect("test server");
         for (path, methods) in documented() {
-            let concrete = path.replace("{id}", "probe-x").replace("{seq}", "1").replace("{gtin}", "09999999999994");
+            let concrete = path
+                .replace("{id}", "probe-x")
+                .replace("{seq}", "1")
+                .replace("{gtin}", "09999999999994");
             for verb in VERBS {
                 let resp = request(
                     &verb.to_uppercase(),
                     &Url::parse(&format!("{}{concrete}", ts.base_url)).expect("probe url"),
                     &[],
-                    if verb == "get" { None } else { Some(b"{}".as_slice()) },
+                    if verb == "get" {
+                        None
+                    } else {
+                        Some(b"{}".as_slice())
+                    },
                     Duration::from_secs(5),
                 )
                 .await

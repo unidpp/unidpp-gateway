@@ -91,7 +91,10 @@ impl FeedbackRecord {
     pub fn from_json(v: &Value) -> Result<FeedbackRecord, String> {
         let obj = v.as_object().ok_or("feedback record must be an object")?;
         Ok(FeedbackRecord {
-            seq: obj.get("seq").and_then(Value::as_u64).ok_or("missing `seq`")?,
+            seq: obj
+                .get("seq")
+                .and_then(Value::as_u64)
+                .ok_or("missing `seq`")?,
             recorded_at: obj
                 .get("recorded_at")
                 .and_then(Value::as_str)
@@ -255,7 +258,10 @@ impl AdmissionControl for RateLimited {
         let now = Instant::now();
         let mut seen = self.seen.lock().expect("rate window poisoned");
         let window = seen.entry(report.identifier.clone()).or_default();
-        while window.front().is_some_and(|t| now.duration_since(*t) >= self.window) {
+        while window
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= self.window)
+        {
             window.pop_front();
         }
         if window.len() >= self.limit {
@@ -293,7 +299,10 @@ mod tests {
         assert_eq!(public["contact"], json!("withheld"));
         assert_eq!(public["category"], json!("goods-mismatch"));
         let admin = store.list_json(10, 0);
-        assert_eq!(admin["records"][0]["contact"], json!("reporter@example.org"));
+        assert_eq!(
+            admin["records"][0]["contact"],
+            json!("reporter@example.org")
+        );
         // Validation refuses the unstated.
         assert!(store
             .submit(

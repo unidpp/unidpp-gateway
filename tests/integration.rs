@@ -760,12 +760,19 @@ async fn feedback_is_journaled_receipted_and_rate_gated() {
     let resp = get(base, "/feedback/1").await;
     assert_eq!(resp.status, 200);
     assert_eq!(json_of(&resp)["contact"], json!("withheld"));
-    assert_eq!(json_of(&resp)["identifier"], json!("gs1:(01)06901234567892"));
+    assert_eq!(
+        json_of(&resp)["identifier"],
+        json!("gs1:(01)06901234567892")
+    );
 
     // An unstated report is refused with a stated reason.
-    let resp = post_json(base, "/feedback", &json!({
-        "identifier": " ", "category": "goods-mismatch", "details": "x"
-    }))
+    let resp = post_json(
+        base,
+        "/feedback",
+        &json!({
+            "identifier": " ", "category": "goods-mismatch", "details": "x"
+        }),
+    )
     .await;
     assert_eq!(resp.status, 400);
     assert!(resp.body_string().contains("`identifier` is required"));
@@ -805,7 +812,10 @@ async fn feedback_is_journaled_receipted_and_rate_gated() {
     assert_eq!(resp.status, 200);
     let listing = json_of(&resp);
     assert_eq!(listing["total"], json!(3));
-    assert_eq!(listing["records"][0]["identifier"], json!("gs1:(01)09506000134352"));
+    assert_eq!(
+        listing["records"][0]["identifier"],
+        json!("gs1:(01)09506000134352")
+    );
     assert!(listing["records"]
         .as_array()
         .unwrap()
@@ -859,10 +869,8 @@ async fn the_scan_gate_states_itself_and_opens_under_policy() {
     assert_eq!(resp.status, 401); // sanity: still gated without it
     let resp = unidpp_gateway::http::request(
         "GET",
-        &unidpp_gateway::http::Url::parse(&format!(
-            "{base}/untp/product/{LAPTOP_PRODUCT_ID}"
-        ))
-        .unwrap(),
+        &unidpp_gateway::http::Url::parse(&format!("{base}/untp/product/{LAPTOP_PRODUCT_ID}"))
+            .unwrap(),
         &[("x-unidpp-scan".to_string(), token.clone())],
         None,
         TIMEOUT,
@@ -877,7 +885,9 @@ async fn the_scan_gate_states_itself_and_opens_under_policy() {
 
     // Throttle: two issuances per source per minute, one already used.
     assert_eq!(
-        post_json(base, "/scan-tokens", &json!({"source": "test-a"})).await.status,
+        post_json(base, "/scan-tokens", &json!({"source": "test-a"}))
+            .await
+            .status,
         201
     );
     let resp = post_json(base, "/scan-tokens", &json!({"source": "test-a"})).await;
@@ -885,7 +895,9 @@ async fn the_scan_gate_states_itself_and_opens_under_policy() {
     assert!(resp.body_string().contains("issuance limit"));
     // A different source has its own window.
     assert_eq!(
-        post_json(base, "/scan-tokens", &json!({"source": "test-b"})).await.status,
+        post_json(base, "/scan-tokens", &json!({"source": "test-b"}))
+            .await
+            .status,
         201
     );
 
@@ -893,7 +905,11 @@ async fn the_scan_gate_states_itself_and_opens_under_policy() {
 
     // Policy off (the default doctrine: public resolution): open.
     let open = spawn_fixtures().await;
-    let resp = get(&open.base_url, &format!("/untp/product/{LAPTOP_PRODUCT_ID}")).await;
+    let resp = get(
+        &open.base_url,
+        &format!("/untp/product/{LAPTOP_PRODUCT_ID}"),
+    )
+    .await;
     assert_eq!(resp.status, 200);
     // And issuance states that the gate is open.
     let resp = post_json(&open.base_url, "/scan-tokens", &json!({"source": "x"})).await;
