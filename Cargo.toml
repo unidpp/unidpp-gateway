@@ -28,6 +28,8 @@ serde_yaml = "0.9"
 utoipa = { version = "5.5.0", features = ["yaml"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
 
+tower = { version = "0.5", features = ["util"] }
+
 [dev-dependencies]
 # Integration tests drive a real unidpp-issuer instance (issuer-mode
 # rendering + live anchor verification) and hand-roll HTTP against the

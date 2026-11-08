@@ -20,6 +20,24 @@ use unidpp_cli::passport::Passport;
 use crate::http::{json_request, Url};
 use crate::verdict::PublicKeyMaterial;
 
+/// The transport boundary of the gateway→issuer edge (REARCH R7):
+/// exactly the two documents the gateway fetches — the passport view
+/// and the keyring — as raw JSON bodies. The default implementation
+/// is the loopback HTTP client inside [`PassportSource`];
+/// [`InProcessIssuer`] is the embedder's bridge, serving both
+/// documents from the issuer module's own router in the same process.
+/// The outcome of one upstream view fetch: the rendered view body,
+/// the pack document, and the trust anchors, or `None` when the
+/// issuer does not know the identifier.
+pub type FetchedView = Option<(String, String, HashMap<String, PublicKeyMaterial>)>;
+
+pub trait IssuerUpstream: Send + Sync {
+    fn fetch_view_and_keyring<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FetchedView> + Send + 'a>>;
+}
+
 /// Where a rendered passport came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -84,11 +102,21 @@ pub struct PassportSource {
     fixtures: Vec<GatewayPassport>,
     issuer_url: Option<String>,
     timeout: Duration,
+    /// The in-process issuer bridge (REARCH R7): when set, issuer
+    /// lookups ride the trait instead of loopback HTTP.
+    issuer_bridge: Option<std::sync::Arc<dyn IssuerUpstream>>,
 }
 
 impl PassportSource {
     /// Assemble the source: the seeded fixtures plus an optional
     /// issuer upstream base URL (`http://host:port`, no trailing path).
+    /// Swap the issuer transport (REARCH R7): the one deployment
+    /// injects the in-process bridge.
+    pub fn with_issuer_bridge(mut self, bridge: std::sync::Arc<dyn IssuerUpstream>) -> Self {
+        self.issuer_bridge = Some(bridge);
+        self
+    }
+
     pub fn new(issuer_url: Option<String>) -> PassportSource {
         let fixtures = crate::fixtures::all()
             .into_iter()
@@ -100,6 +128,7 @@ impl PassportSource {
                 .map(|u| u.trim().trim_end_matches('/').to_string())
                 .filter(|u| !u.is_empty()),
             timeout: Duration::from_secs(2),
+            issuer_bridge: None,
         }
     }
 
@@ -158,24 +187,31 @@ impl PassportSource {
     /// no-information); a configured-but-unreachable issuer degrades to
     /// the fixtures through the earlier fixture match.
     async fn issuer_lookup(&self, id: &str) -> Option<GatewayPassport> {
-        let base = self.issuer_url.as_ref()?;
-        let id = Url::encode_query_component(id);
-        let response = json_request(
-            "GET",
-            &format!("{base}/passports/{id}"),
-            None,
-            None,
-            self.timeout,
-        )
-        .await
-        .ok()?;
-        if response.status != 200 {
-            return None;
-        }
-        let view: Value = serde_json::from_str(&response.body_string()).ok()?;
-        let document = Passport::from_json(&response.body_string()).ok()?;
+        let (view_body, document_body, anchors) = match &self.issuer_bridge {
+            Some(bridge) => bridge.fetch_view_and_keyring(id).await?,
+            None => {
+                let base = self.issuer_url.as_ref()?;
+                let encoded = Url::encode_query_component(id);
+                let response = json_request(
+                    "GET",
+                    &format!("{base}/passports/{encoded}"),
+                    None,
+                    None,
+                    self.timeout,
+                )
+                .await
+                .ok()?;
+                if response.status != 200 {
+                    return None;
+                }
+                let body = response.body_string();
+                let keyring_body = self.fetch_keyring_body(base).await;
+                (body.clone(), body, keyring_body)
+            }
+        };
+        let view: Value = serde_json::from_str(&view_body).ok()?;
+        let document = Passport::from_json(&document_body).ok()?;
         let profiles = parse_config_profiles(&view);
-        let anchors = self.fetch_anchors(base).await;
         Some(GatewayPassport {
             document,
             profiles,
@@ -184,20 +220,25 @@ impl PassportSource {
         })
     }
 
-    /// Best-effort keyring fetch: the public anchors a verifier pins.
-    /// An unreachable keyring yields no anchors (the verdict's
-    /// `key-unanchored` rule then fails loudly — never silently).
-    async fn fetch_anchors(&self, base: &str) -> HashMap<String, PublicKeyMaterial> {
+    /// The keyring body through the bridge, or over HTTP standalone.
+    async fn fetch_keyring_body(&self, base: &str) -> HashMap<String, PublicKeyMaterial> {
+        Self::parse_keyring_body(
+            json_request("GET", &format!("{base}/keyring"), None, None, self.timeout)
+                .await
+                .map(|r| r.body_string()),
+        )
+    }
+
+    /// The keyring parse, shared by the HTTP path and the bridge.
+    fn parse_keyring_body(body: Result<String, String>) -> HashMap<String, PublicKeyMaterial> {
         let mut out = HashMap::new();
-        let Ok(response) =
-            json_request("GET", &format!("{base}/keyring"), None, None, self.timeout).await
-        else {
+        let Ok(body) = body else {
             return out;
         };
-        if response.status != 200 {
+        if body.is_empty() {
             return out;
         }
-        let Ok(keyring) = serde_json::from_str::<Value>(&response.body_string()) else {
+        let Ok(keyring) = serde_json::from_str::<Value>(&body) else {
             return out;
         };
         let Some(roles) = keyring.get("roles").and_then(Value::as_object) else {
@@ -219,6 +260,57 @@ impl PassportSource {
             }
         }
         out
+    }
+}
+
+/// The in-process issuer bridge (REARCH R7): the same two GETs the
+/// HTTP path makes, served from the issuer module's own router in the
+/// same process — no sockets, no URL. The encoding and parsing are
+/// this crate's own, so the parity with the HTTP path is by
+/// construction.
+pub struct InProcessIssuer {
+    pub router: axum::Router,
+}
+
+impl InProcessIssuer {
+    async fn get(&self, path: &str) -> Option<String> {
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .expect("static request parts");
+        let response = tower::util::ServiceExt::oneshot(&mut self.router.clone(), request)
+            .await
+            .expect("the issuer router answers");
+        if response.status() != axum::http::StatusCode::OK {
+            return None;
+        }
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+impl IssuerUpstream for InProcessIssuer {
+    fn fetch_view_and_keyring<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Option<(String, String, HashMap<String, PublicKeyMaterial>)>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let encoded = Url::encode_query_component(id);
+            let view = self.get(&format!("/passports/{encoded}")).await?;
+            let keyring = self.get("/keyring").await.unwrap_or_default();
+            let anchors = PassportSource::parse_keyring_body(Ok(keyring.clone()));
+            Some((view.clone(), view, anchors))
+        })
     }
 }
 
