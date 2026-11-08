@@ -1753,6 +1753,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tower",
  "unidpp-cli",
  "unidpp-event",
  "unidpp-model",
