@@ -220,6 +220,16 @@ impl AppState {
             config,
         }
     }
+
+    /// Swap the issuer transport (REARCH R7): the one deployment
+    /// injects the in-process bridge.
+    pub fn with_issuer_bridge(
+        mut self,
+        bridge: std::sync::Arc<dyn crate::source::IssuerUpstream>,
+    ) -> AppState {
+        self.source = self.source.with_issuer_bridge(bridge);
+        self
+    }
 }
 
 /// POST /scan-tokens {source} — issue a scan token under the
