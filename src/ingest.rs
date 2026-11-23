@@ -176,7 +176,7 @@ impl IngestStore {
 }
 
 /// The passport VC inside any accepted body shape.
-fn extract_stub(body: &Value) -> Result<&Value, String> {
+pub fn extract_stub(body: &Value) -> Result<&Value, String> {
     if let Some(stub) = body.get("stub") {
         return Ok(stub);
     }
@@ -191,7 +191,7 @@ fn extract_stub(body: &Value) -> Result<&Value, String> {
     Err("no UNTP passport VC found (expected {passport: {...productIdentifiers...}}, a bare passport VC, or {stub: {...}})".to_string())
 }
 
-fn extract_conformity(body: &Value) -> Vec<&Value> {
+pub fn extract_conformity(body: &Value) -> Vec<&Value> {
     body.get("conformity")
         .and_then(Value::as_array)
         .map(|items| items.iter().collect())
@@ -201,7 +201,7 @@ fn extract_conformity(body: &Value) -> Vec<&Value> {
 /// Parse the subject identity from the first product identifier, using
 /// the same scheme/value rules as the render direction. Unknown
 /// schemes degrade explicitly — the caller reports, nothing mints.
-fn parse_identity(stub: &Value) -> Result<(ProductIdentifier, Vec<String>), String> {
+pub fn parse_identity(stub: &Value) -> Result<(ProductIdentifier, Vec<String>), String> {
     let ids = stub
         .get("productIdentifiers")
         .and_then(Value::as_array)
@@ -245,7 +245,7 @@ fn parse_identity(stub: &Value) -> Result<(ProductIdentifier, Vec<String>), Stri
 /// Deterministic passport id from the subject identity alone: the same
 /// subject maps to the same identity forever (I1) — a different stub
 /// for the same product *matches* rather than duplicating.
-fn derived_passport_id(identity: &ProductIdentifier) -> String {
+pub fn derived_passport_id(identity: &ProductIdentifier) -> String {
     let digest = sha256(&[
         b"UNIDPP/GATEWAY/UNTP-INGEST|",
         identity.to_string().as_bytes(),
@@ -255,7 +255,7 @@ fn derived_passport_id(identity: &ProductIdentifier) -> String {
 
 /// Conformity credentials → profile bindings: one binding per
 /// credential that names a conformity standard.
-fn conformity_bindings(conformity: &[&Value]) -> Vec<ProfileRef> {
+pub fn conformity_bindings(conformity: &[&Value]) -> Vec<ProfileRef> {
     let mut bindings = Vec::new();
     for credential in conformity {
         let Some(subject) = credential.get("credentialSubject") else {
@@ -291,7 +291,7 @@ fn profiles_of(passport: &GatewayPassport) -> Vec<ProfileRef> {
     passport.profiles.clone()
 }
 
-fn scheme_uri_of(stub: &Value) -> Option<&str> {
+pub fn scheme_uri_of(stub: &Value) -> Option<&str> {
     stub.get("productIdentifiers")
         .and_then(Value::as_array)
         .and_then(|a| a.first())
